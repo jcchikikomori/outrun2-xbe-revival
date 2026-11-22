@@ -323,6 +323,40 @@ Evaluate each feature independently:
 
 Each enhancement requires its own regression gate and must not alter game simulation unless separately verified.
 
+### Phase 6: OutRun 2006: Coast 2 Coast (Xbox) as a second title (planned)
+
+Follow-on title, decided 2026-11-20. The PC port (OutRun 2006: Coast 2 Coast, DirectX 9)
+shares the source lineage (Xbox OutRun 2 -> arcade SDX -> PC port) and doubles as a static
+analysis reference for the shared code, so most of this project's runtime work transfers.
+
+Decisions:
+
+- **Repository: a fork of this repo per title.** The game-specific surface is already
+  isolated (`scripts/game.env`, `config/`, the `add_xbe_image` target, smoke scripts), so
+  the fork keeps the SDK submodule pointing at the shared `recomp-the-duke` fork — every
+  DSOUND/D3D9/kernel fix lands once and serves both titles.
+- **Gate: user acquires the retail C2C Xbox disc first.** No scan, no CI, no code until a
+  legally owned XBE exists (same media rule as section 1).
+- **Start: after OutRun 2 Version 1.0 is playable** (the DSOUND lifetime-fix pattern now
+  being proven is a prerequisite anyway).
+
+Bootstrap checklist (for the fork, once the disc exists):
+
+1. Extract the disc with xdvdfs; note the XDK of the XBE (OutRun 2 is 5849; C2C ships on
+   a later XDK). `xbe_symbols` needs a signature database for *that* XDK — expect the
+   same class of dropped/degraded signatures that cost this project the ~20 s
+   C0000005 (see the 5849 SetPitch/SetEG lesson) and budget a scan-fix-verify loop.
+2. New `game.env` + `config/game.toml` scan against the user-owned XBE; new
+   `add_xbe_image` target; new smoke/pad scripts for its menus.
+3. Audit new runtime surface: XONLINE/XNET (C2C has live features — for offline play,
+   follow the OutRun 2 pattern of HLE-covering the online path), save/YSI differences,
+   audio library deltas vs 5849.
+4. CI: fork inherits the workflows; set its own `OUTRUN2_XBE_PATH`-style repository
+   variable pointing at that disc's XBE; the same self-hosted runner serves both repos
+   (one registration, one work dir — AGENTS.md section 8).
+5. Reuse as-is: extract-once ISO flow, D3D9 backend and its settings, cross-build/
+   release model, harness lanes, the PC `OR2006C2C.exe` as RE reference for shared code.
+
 ## 7. Phase 0 Static Feasibility Audit
 
 The audit uses the flat PE and a Ghidra project containing the `Decomp`, `FindOperand`, and `Callers` scripts used by the `pgr2-recomp` reference project.
