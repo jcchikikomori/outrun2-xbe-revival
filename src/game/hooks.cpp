@@ -12,11 +12,43 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <mutex>
+#include <unordered_set>
 
 #include "xdk/d3d8.h"
 #include "xdk/hle.h"
 
 namespace {
+
+// sub_000CBB70 publishes its semaphore at [resource+0x20] before waiting on it. The worker in
+// sub_000CB530 can drain [resource+0x1C] after the requester's first read but before that publish,
+// so no release is ever queued. These are the only guest fields the boot hook touches.
+constexpr uint32_t kBootPending = 0x1C;
+constexpr uint32_t kBootSemaphore = 0x20;
+
+// Guards one resource against two host threads completing the same published semaphore. The hook is
+// at the single instruction that publishes the handle, so duplicate calls with the same handle are
+// already rejected below; this additionally rejects a nested call on the same resource.
+std::mutex g_boot_resource_lock;
+std::unordered_set<uint32_t> g_boot_resources;
+
+class BootResourceGuard {
+public:
+    explicit BootResourceGuard(uint32_t resource) : resource_(resource) {
+        std::lock_guard<std::mutex> lock(g_boot_resource_lock);
+        entered_ = g_boot_resources.insert(resource_).second;
+    }
+    ~BootResourceGuard() {
+        if (!entered_) return;
+        std::lock_guard<std::mutex> lock(g_boot_resource_lock);
+        g_boot_resources.erase(resource_);
+    }
+    bool entered() const { return entered_; }
+
+private:
+    uint32_t resource_;
+    bool entered_ = false;
+};
 
 // The static CDevice (DAT_001a4148 points at it) and the fields D3DDevice_SetVertexShader keeps.
 // Its guest body (0x00196DF0) stores the object it bound at +0x794 and the handle it was bound as
@@ -138,6 +170,7 @@ void CacheFvfLayout(const uint32_t recs[16][2]) {
 }  // namespace
 
 X86_EXTERN_FUNC(__imp__sub_00195CF0);
+X86_EXTERN_FUNC(sub_0013CE40);
 
 // D3DDevice_DrawIndexedVerticesUP (0x00195CF0, an XDK routine the SDK does not name or HLE) divides 0x7FF
 // by the CDevice's cached vertex layout at its first act: `MOV ECX,ESI; CALL 0x0019E9E0` at 0x00195D04,
@@ -167,4 +200,79 @@ X86_FUNC(sub_00195CF0) {
         LOGR_FIRST(4, "hooks: 00195CF0 cached the FVF %X layout for the draw's vertex copy", handle);
     }
     __imp__sub_00195CF0(ctx, base);
+}
+
+// Instruction hook declared in config/outrun2.toml after 0x000CBBAD (`mov [esi+0x20], eax`), the
+// point where sub_000CBB70 has just published the semaphore it is about to wait on. The guest's own
+// first pending read is at 0x000CBB96, before the publish; under host-scheduled guest threads the
+// worker can take pending from 1 to 0 in that gap and, because [resource+0x20] was still zero, skip
+// its release at 0x000CB58A. The requester then waits forever on a count-zero semaphore.
+//
+// Re-read pending after the publish. If work is still pending, return false and let the original
+// wait at 0x000CBBB0 run. If pending is zero, return true so the generated on_true jump lands at
+// 0x000CBBB5: the guest itself reloads the published handle, calls its F0795 close wrapper, clears
+// [resource+0x20], then runs the callback and free at 0x000CBBC5 onward. No cleanup is duplicated
+// here and the wait's successor owns the exact original close/clear sequence.
+//
+// The handle check rejects a second completion of the same publication; the resource guard rejects
+// re-entry from another guest thread while this one is deciding. A worker that had already read the
+// handle may still call NtReleaseSemaphore after the close; handles are never reused by the SDK and
+// that worker ignores the return value, so it cannot wake or corrupt another object.
+bool FixBootSemaphoreRace(X86Context& ctx, uint8_t* base) {
+    const uint32_t resource = ctx.esi;
+    if (!resource) return false;
+
+    const uint32_t published = X86_MEM32(resource + kBootSemaphore);
+    const uint32_t pending = X86_MEM32(resource + kBootPending);
+    if (!published || published != ctx.eax) {
+        LOGR("hooks: 000CBB70 resource %08X handle %08X slot %08X, publication already completed",
+             resource, ctx.eax, published);
+        return false;
+    }
+    if (pending != 0) {
+        LOGR("hooks: 000CBB70 resource %08X handle %08X pending %u, keeping the guest wait",
+             resource, published, pending);
+        return false;
+    }
+
+    BootResourceGuard guard(resource);
+    if (!guard.entered()) {
+        LOGR("hooks: 000CBB70 resource %08X handle %08X, re-entrant completion ignored", resource, published);
+        return false;
+    }
+
+    // Re-read after taking the guard in case the other thread completed while we were entering it.
+    if (X86_MEM32(resource + kBootPending) != 0 || X86_MEM32(resource + kBootSemaphore) != published) {
+        LOGR("hooks: 000CBB70 resource %08X handle %08X, completion superseded", resource, published);
+        return false;
+    }
+
+    LOGR("hooks: 000CBB70 resource %08X handle %08X pending 0, skipped the wait; guest tail closes it",
+         resource, published);
+    return true;
+}
+
+// Class B WX I/O completion starvation (title-specific, not an SDK/kernel semantic change).
+//
+// Guest WX reads queued by sub_0013C390 are deferred: byte[obj+1]=2 (busy), dword[obj+0x54]=1
+// (submit requested), dword[obj+0x58]=0. They only advance through sub_0013CE40 -> sub_0013CD90,
+// which submits the ReadFile wrapper (000F221A/sub_0013C960), polls GetOverlappedResult
+// (000F2BE3/sub_0013C070), and on completion sets byte[obj+1]=1. The only static pump
+// sub_0013D050 is an init-time drain reached through 0004B120; it is not persistent.
+//
+// sub_00137AD0 is a blocking upper-engine wait: it calls sub_001374A0 once, then loops calling
+// sub_00137940 until byte[esi+1]==1 and [esi+0x20]==0. It never pumps WX, so a queued WX read can
+// remain pending forever while the upper engine/worker callback (sub_000CB3F0) waits for completion.
+// Diag10 showed worker 2C stuck on resource 0107AF50/item 0107B8C0 with pending 1 after
+// data1.cvm/Voice1.xwb opens.
+//
+// These before-hooks run at 00137AE0 (sub_00137AD0 wait loop, before sub_00137940 polls) and at
+// 000CB3F0 (worker callback status poll, before reading handle+1). Each invokes the guest's
+// existing WX pump sub_0013CE40 and restores all CPU-visible X86Context state (GPRs, flags,
+// x87/SSE/MMX/runtime-owned fields as copied) so the original wait/poll observes the same register
+// state; only intentional guest-memory side effects from the pump remain.
+void PumpWxWhileIoWait(X86Context& ctx, uint8_t* base) {
+    const X86Context saved = ctx;
+    sub_0013CE40(ctx, base);
+    ctx = saved;
 }

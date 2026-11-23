@@ -34,7 +34,7 @@ A successful result is a build that starts from the user's own disc, reaches the
 - A Windows-compatible x64 executable generated from the user's `default.xbe`.
 - Recompile everything from the original game (including shaders), before booting up.
 - To compile the shaders, we can dump the shader cache being generated, then we will use it for recompilation to minimize stutters in-game.
-- Minimum graphics pipeline should be DirectX 9, since the game and the console runs on DirectX 8.
+- Graphics priority is Direct3D 12 (original pipeline). No experimental backend is required for Version 1.0.
 - A Steam Deck playtest path through Wine, Bottles, or Proton.
 - Boot to the title screen and navigation through the menus.
 - At least one complete race course, followed by coverage of all five OutRun courses.
@@ -51,6 +51,7 @@ A successful result is a build that starts from the user's own disc, reaches the
 - Original Xbox hardware output.
 - Ultrawide rendering, HDR10, arbitrary high frame rates, and custom music.
 - A native Linux Vulkan, macOS, Android, or console backend.
+- Direct3D 11, Vulkan, OpenGL, and only then Direct3D 9 as a legacy compatibility fallback.
 - A polished end-user launcher.
 - Steering-wheel force feedback unless the Phase 0 audit proves it is required for the original game to function.
 
@@ -174,7 +175,7 @@ The repository must enforce ignores for `assets/`, `generated/`, `.local/`, cras
 - The first playable run exposed a null default FVF shader object. Ghidra traced the guest initialization to `0x1A67C8`; the title-specific `D3D_FvfShader` data override removes the former profile-scene access violation. Independent fixed-build runs lasted 203 and 186 seconds without a crash.
 - A GitHub Actions pipeline validates every change and builds the code-free host tools on GitHub-hosted runners, while the game executable is built on a dedicated self-hosted runner that holds the user's `default.xbe`. The compiled executable is published only behind an explicit gate, because artifacts of a public repository are public.
 - OUTRUN MODE no longer traps. The divide error at guest `0x00195D6B` came from a zero cached vertex layout in the `CDevice`: the SDK's HLE for `D3DDevice_SetVertexShader` and `D3DDevice_SetStreamSource` replaces the guest bodies that filled it. A hook at `0x00195D09` caches the draw's own stride, and the headless run reaches the race start (`docs/evidence/phase0/outrun-mode-trap.md`).
-- The SDK fork merged the Direct3D 9 renderer fork (`bechapm/XboxXBERecomp-D3D9`) behind the new `renderer` settings key, and restored the headless harness and the `hk21x` helper scripts the project tooling expects. After the runtime's Linux-compat bring-up, the headless boot of the extracted disc data reaches frame 720 at the measured 60 Hz cadence with 1431 draws and no traps. The playable lane now has two renderer options: `d3d12` (vkd3d-proton) and `d3d9` (DXVK), with D3D9 as the plan's minimum pipeline.
+- The SDK fork retains the headless harness and helper scripts required by the project tooling. The experimental D3D9 backend was selectively rolled back after graphics instability; D3D12 remains the project’s original-priority renderer. The historical headless boot of extracted disc data reached frame 720 at a measured 60 Hz cadence with 1431 draws and no traps. The rollback has not yet been verified with a visual D3D12 comparison.
 
 #### Remaining tasks
 
@@ -334,7 +335,7 @@ Decisions:
 - **Repository: a fork of this repo per title.** The game-specific surface is already
   isolated (`scripts/game.env`, `config/`, the `add_xbe_image` target, smoke scripts), so
   the fork keeps the SDK submodule pointing at the shared `recomp-the-duke` fork — every
-  DSOUND/D3D9/kernel fix lands once and serves both titles.
+  DirectSound, XDK graphics, and kernel fixes land once and serve both titles.
 - **Gate: user acquires the retail C2C Xbox disc first.** No scan, no CI, no code until a
   legally owned XBE exists (same media rule as section 1).
 - **Start: after OutRun 2 Version 1.0 is playable** (the DSOUND lifetime-fix pattern now
@@ -354,7 +355,7 @@ Bootstrap checklist (for the fork, once the disc exists):
 4. CI: fork inherits the workflows; set its own `OUTRUN2_XBE_PATH`-style repository
    variable pointing at that disc's XBE; the same self-hosted runner serves both repos
    (one registration, one work dir — AGENTS.md section 8).
-5. Reuse as-is: extract-once ISO flow, D3D9 backend and its settings, cross-build/
+5. Reuse as-is: extract-once ISO flow, the D3D12-first renderer path and its settings, cross-build/
    release model, harness lanes, the PC `OR2006C2C.exe` as RE reference for shared code.
 
 ## 7. Phase 0 Static Feasibility Audit

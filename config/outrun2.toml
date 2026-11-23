@@ -28,6 +28,39 @@ D3D_FvfShader = 0x001A67C8
 # and lets the guest's own FUN_00196200 / FUN_0019E9E0 build and cache the layout; see
 # docs/evidence/phase0/outrun-mode-trap.md.
 
+# Boot race in sub_000CBB70: the guest reads [resource+0x1C] at 0x000CBB96, then publishes its new
+# semaphore at [resource+0x20] at 0x000CBBAD. A worker can drain pending to zero between those two
+# points and skip its release because the handle was not visible yet, leaving the requester waiting
+# on a count-zero semaphore. src/game/hooks.cpp re-checks pending after the publish and, when the
+# work is already gone, jumps to 0x000CBBB5. The guest's own wait successor then reloads the handle,
+# calls F0795, clears the slot and runs the callback/free tail, so no cleanup is duplicated. This is
+# title-specific; the SDK object and scheduler semantics are unchanged.
+[[hook]]
+at = 0x000CBBAD
+call = "FixBootSemaphoreRace"
+after = true
+on_true = 0x000CBBB5
+
+# Class B WX I/O completion starvation: sub_0013C390 queues WX reads as busy (byte[obj+1]=2,
+# dword[obj+0x54]=1 submit requested, dword[obj+0x58]=0) but does not issue ReadFile. The guest
+# advances them only through sub_0013CE40/sub_0013CD90, which submit/poll and on completion set
+# byte[obj+1]=1. The only static pump sub_0013D050 is an init-time drain reached through 0004B120;
+# it is not persistent. sub_00137AD0 waits by looping sub_00137940 until byte[esi+1]==1 and
+# [esi+0x20]==0, never pumping WX; worker callback sub_000CB3F0 also polls handle status in
+# sub_000CB6E0's loop without pumping WX. A queued WX read can remain pending forever, stalling
+# the upper engine / worker. Pump the existing guest WX pump once per upper-engine wait iteration
+# and once per worker status callback poll. This is title-specific scheduling adaptation; SDK/kernel
+# I/O object semantics and generated game code are unchanged.
+[[hook]]
+at = 0x00137AE0
+call = "PumpWxWhileIoWait"
+after = false
+
+[[hook]]
+at = 0x000CB3F0
+call = "PumpWxWhileIoWait"
+after = false
+
 # Add title-specific entries below, following the examples in config/game.toml:
 #
 # [xbe]
